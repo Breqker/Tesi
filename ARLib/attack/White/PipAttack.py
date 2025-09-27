@@ -10,6 +10,32 @@ import torch.nn.functional as F
 import scipy.sparse as sp
 from copy import deepcopy
 
+def compute_norm_adj(interact_mat):
+    """Costruisce e normalizza la matrice di adiacenza."""
+    num_users, num_items = interact_mat.shape
+    A = sp.dok_matrix((num_users + num_items, num_users + num_items), dtype=np.float32)
+
+    A[:num_users, num_users:] = interact_mat
+    A[num_users:, :num_users] = interact_mat.T
+
+    degree = np.array(A.sum(axis=1)).flatten()
+    d_inv_sqrt = np.power(degree, -0.5)
+    d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.0
+    D_inv_sqrt = sp.diags(d_inv_sqrt)
+
+    return (D_inv_sqrt @ A @ D_inv_sqrt).tocsr()
+
+
+def convert_sparse_mat_to_tensor(sparse_mx):
+    """Converte scipy.sparse in torch.sparse_coo_tensor."""
+    sparse_mx = sparse_mx.tocoo().astype(np.float32)
+    indices = torch.from_numpy(
+        np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64)
+    )
+    values = torch.from_numpy(sparse_mx.data)
+    shape = torch.Size(sparse_mx.shape)
+    return torch.sparse_coo_tensor(indices, values, shape)
+
 class MLP(nn.Module):
     def __init__(self, input_size):
         super(MLP, self).__init__()
@@ -222,35 +248,68 @@ class PipAttack():
 
     def fakeUserInject(self, recommender):
         Pu, Pi = recommender.model()
+        Pu = Pu.detach().cpu()
+        Pi = Pi.detach().cpu()
+
+        # aggiorna numero utenti
         recommender.data.user_num += self.fakeUserNum
         for i in range(self.fakeUserNum):
-            recommender.data.user["fakeuser{}".format(i)] = len(recommender.data.user)
-            recommender.data.id2user[len(recommender.data.user) - 1] = "fakeuser{}".format(i)
+            recommender.data.user[f"fakeuser{i}"] = len(recommender.data.user)
+            recommender.data.id2user[len(recommender.data.user) - 1] = f"fakeuser{i}"
 
+        # lista di fake user
         self.fakeUser = list(range(self.userNum, self.userNum + self.fakeUserNum))
+
+        # aggiorna interazioni
         row, col, entries = [], [], []
         for u in self.fakeUser:
-            sampleItem =  random.sample(set(list(range(self.itemNum))),self.maliciousFeedbackNum)
-            for i in sampleItem:
-                recommender.data.training_data.append((recommender.data.id2user[u],recommender.data.id2item[i]))
+            sampleItem = random.sample(range(self.itemNum), self.maliciousFeedbackNum)
+            for it in sampleItem:
+                recommender.data.training_data.append(
+                    (recommender.data.id2user[u], recommender.data.id2item[it])
+                )
         for pair in recommender.data.training_data:
-            row += [recommender.data.user[pair[0]]]
-            col += [recommender.data.item[pair[1]]]
-            entries += [1.0]
+            row.append(recommender.data.user[pair[0]])
+            col.append(recommender.data.item[pair[1]])
+            entries.append(1.0)
 
-        recommender.data.interaction_mat = sp.csr_matrix((entries, (row, col)),
-                                                         shape=(recommender.data.user_num, recommender.data.item_num),
-                                                         dtype=np.float32)
+        recommender.data.interaction_mat = sp.csr_matrix(
+            (entries, (row, col)),
+            shape=(recommender.data.user_num, recommender.data.item_num),
+            dtype=np.float32
+        )
 
+        # costruisci adjacency completa e normalizzata
+        adj_full = compute_norm_adj(recommender.data.interaction_mat)
+        recommender.data.norm_adj = adj_full
+
+        # reinizializza il recommender
         recommender.__init__(recommender.args, recommender.data)
+
+        # rialloca embeddings
         with torch.no_grad():
             try:
-                recommender.model.embedding_dict['user_emb'][:Pu.shape[0]] = Pu
-                recommender.model.embedding_dict['item_emb'][:] = Pi
-            except:
-                recommender.model.embedding_dict['user_mf_emb'][:Pu.shape[0]] = Pu[:Pu.shape[0], :Pu.shape[1]//2]
-                recommender.model.embedding_dict['user_mlp_emb'][:Pu.shape[0]] = Pu[:Pu.shape[0], Pu.shape[1]//2:]
-                recommender.model.embedding_dict['item_mf_emb'][:] = Pi[:, :Pi.shape[1]//2]
-                recommender.model.embedding_dict['item_mlp_emb'][:] = Pi[:, Pi.shape[1]//2:]
+                if Pu is not None and 'user_emb' in recommender.model.embedding_dict:
+                    recommender.model.embedding_dict['user_emb'][:Pu.shape[0], :] = Pu
+                    recommender.model.embedding_dict['item_emb'][:Pi.shape[0], :] = Pi
+                else:
+                    # fallback per NCF/MLP
+                    for key in ['user_mf_emb','user_mlp_emb','item_mf_emb','item_mlp_emb']:
+                        if key in recommender.model.embedding_dict:
+                            old = recommender.model.embedding_dict[key]
+                            new = torch.zeros(
+                                (recommender.data.user_num if 'user' in key else recommender.data.item_num,
+                                old.shape[1])
+                            ).to(old.device)
+                            new[:old.shape[0]] = old
+                            recommender.model.embedding_dict[key] = nn.Parameter(new)
+            except Exception:
+                pass
+
+        # aggiorna sparse_norm_adj
+        try:
+            recommender.model.sparse_norm_adj = convert_sparse_mat_to_tensor(adj_full).cuda()
+        except Exception:
+            recommender.model.sparse_norm_adj = convert_sparse_mat_to_tensor(adj_full)
 
         recommender.model = recommender.model.cuda()
