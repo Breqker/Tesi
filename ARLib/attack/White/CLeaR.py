@@ -68,7 +68,10 @@ class CLeaR():
                 self.userNum + self.fakeUserNum + self.itemNum, self.userNum + self.fakeUserNum + self.itemNum),
                                     dtype=np.float32)
             ui_adj[:self.userNum + self.fakeUserNum, self.userNum + self.fakeUserNum:] = uiAdj2
-            tmpRecommender.model._init_uiAdj(ui_adj + ui_adj.T)
+            try:
+                tmpRecommender.model._init_uiAdj(ui_adj + ui_adj.T)
+            except Exception:
+                tmpRecommender.model.data.interaction_mat = uiAdj2
             optimizer_attack = torch.optim.Adam(tmpRecommender.model.parameters(), lr=recommender.args.lRate)
             for _ in range(self.outerEpoch):
                 Pu, Pi = tmpRecommender.model()
@@ -142,7 +145,10 @@ class CLeaR():
                                    dtype=np.float32)
             ui_adj[:self.userNum + self.fakeUserNum, self.userNum + self.fakeUserNum:] = uiAdj
 
-            recommender.model._init_uiAdj(ui_adj + ui_adj.T)
+            try:
+                recommender.model._init_uiAdj(ui_adj + ui_adj.T)
+            except Exception:
+                recommender.model.data.interaction_mat = uiAdj2
             recommender.train(Epoch=self.innerEpoch, optimizer=optimizer, evalNum=5)
 
             attackmetrics = AttackMetric(recommender, self.targetItem, [topk])

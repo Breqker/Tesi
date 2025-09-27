@@ -6,14 +6,9 @@ import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 from util.tool import targetItemSelect
 from util.metrics import AttackMetric
-from util.algorithm import find_k_largest
 import torch.nn.functional as F
 import scipy.sparse as sp
 from copy import deepcopy
-from util.loss import bpr_loss, l2_reg_loss
-from sklearn.neighbors import LocalOutlierFactor as LOF
-from recommender.GMF import GMF
-import logging
 
 class MLP(nn.Module):
     def __init__(self, input_size):
@@ -31,10 +26,6 @@ class MLP(nn.Module):
 
 class PipAttack():
     def __init__(self, arg, data):
-        """
-        :param arg: parameter configuration
-        :param data: dataLoder
-        """
         self.data = data
         self.interact = data.matrix()
         self.userNum = self.interact.shape[0]
@@ -46,11 +37,10 @@ class PipAttack():
         self.innerEpoch = arg.innerEpoch
         self.outerEpoch = arg.outerEpoch
 
-        # capability prior knowledge
         self.recommenderGradientRequired = False
         self.recommenderModelRequired = True
 
-        # limitation 
+        # Limitation
         self.maliciousUserSize = arg.maliciousUserSize
         self.maliciousFeedbackSize = arg.maliciousFeedbackSize
         if self.maliciousFeedbackSize == 0:
@@ -58,7 +48,7 @@ class PipAttack():
         elif self.maliciousFeedbackSize >= 1:
             self.maliciousFeedbackNum = self.maliciousFeedbackSize
         else:
-            self.maliciousFeedbackNum = int(self.maliciousFeedbackSize * self.item_num)
+            self.maliciousFeedbackNum = int(self.maliciousFeedbackSize * self.itemNum)
 
         if self.maliciousUserSize < 1:
             self.fakeUserNum = int(data.user_num * self.maliciousUserSize)
@@ -66,41 +56,40 @@ class PipAttack():
             self.fakeUserNum = int(self.maliciousUserSize)
 
         self.batchSize = 2048
+        # FIX: la MLP deve essere dimensionata solo sui real user
         self.popularity_model = MLP(self.realuserNum)
-        self.init_popularity_mlp()
         self.alpha = 0.1
+        self.init_popularity_mlp()
 
-
-    
     def init_popularity_mlp(self):
         n = int(self.itemNum * 0.2)
-        sorteditem = np.argsort(self.interact[:, :].sum(0))
+        sorteditem = np.argsort(self.interact.sum(axis=0))
         popular_items = sorteditem[-n:]
-        unpopular_items = sorteditem[:n]
 
         labels = np.zeros(self.itemNum)
         labels[popular_items] = 1
 
+        # FIX: input della MLP sono solo real user
         popular_data = torch.tensor(self.interact.T.todense(), dtype=torch.float32)
         one_hot_labels = np.zeros((self.itemNum, 2))
         for idx in range(self.itemNum):
-            one_hot_labels[idx] = [1, 0] if labels[idx] == 0 else [0, 1]
+            one_hot_labels[idx] = [1,0] if labels[idx]==0 else [0,1]
         labels = torch.tensor(one_hot_labels, dtype=torch.float32)
 
         dataset = TensorDataset(popular_data, labels)
         train_loader = DataLoader(dataset, batch_size=64, shuffle=True)
 
         criterion = nn.CrossEntropyLoss()
-        popularityoptimizer = optim.Adam(self.popularity_model.parameters(), lr=0.001)
+        optimizer = optim.Adam(self.popularity_model.parameters(), lr=0.001)
 
         for epoch in range(10):
-            for i, (inputs, labels) in enumerate(train_loader):
-                popularityoptimizer.zero_grad()
+            for inputs, lbl in train_loader:
+                optimizer.zero_grad()
                 outputs = self.popularity_model(inputs)
-                loss = criterion(outputs, labels)
+                loss = criterion(outputs, lbl)
                 loss.backward()
-                popularityoptimizer.step()
-            print(f'Epoch {epoch+1} popularityloss: {loss.item():.3f}')
+                optimizer.step()
+            print(f"Epoch {epoch+1} popularity loss: {loss.item():.3f}")
 
     def posionDataAttack(self, recommender):
         self.fakeUserInject(recommender)
@@ -117,7 +106,10 @@ class PipAttack():
                 self.userNum + self.fakeUserNum + self.itemNum, self.userNum + self.fakeUserNum + self.itemNum),
                                     dtype=np.float32)
             ui_adj[:self.userNum + self.fakeUserNum, self.userNum + self.fakeUserNum:] = uiAdj2
-            tmpRecommender.model._init_uiAdj(ui_adj + ui_adj.T)
+            try:
+                tmpRecommender.model._init_uiAdj(ui_adj + ui_adj.T)
+            except Exception:
+                tmpRecommender.model.data.interaction_mat = uiAdj2
             optimizer_attack = torch.optim.Adam(tmpRecommender.model.parameters(), lr=recommender.args.lRate)
             for _ in range(self.outerEpoch):
                 Pu, Pi = tmpRecommender.model()
@@ -145,7 +137,7 @@ class PipAttack():
                 
                 criterion = nn.CrossEntropyLoss()
                 popular_data = torch.tensor(self.interact.T.todense(), dtype=torch.float32)
-                outputs = self.popularity_model(popular_data[self.targetItem])
+                outputs = self.popularity_model(popular_data[self.targetItem, :self.realuserNum])
 
                 one_hot_labels = np.zeros((len(self.targetItem), 2))
                 for idx in range(len(self.targetItem)):
@@ -193,7 +185,10 @@ class PipAttack():
                                    dtype=np.float32)
             ui_adj[:self.userNum + self.fakeUserNum, self.userNum + self.fakeUserNum:] = uiAdj
 
-            recommender.model._init_uiAdj(ui_adj + ui_adj.T)
+            try:
+                recommender.model._init_uiAdj(ui_adj + ui_adj.T)
+            except Exception:
+                recommender.model.data.interaction_mat = uiAdj2
             recommender.train(Epoch=self.innerEpoch, optimizer=optimizer, evalNum=5)
 
             attackmetrics = AttackMetric(recommender, self.targetItem, [topk])

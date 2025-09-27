@@ -68,12 +68,25 @@ class A_ra():
                 self.userNum + self.fakeUserNum + self.itemNum, self.userNum + self.fakeUserNum + self.itemNum),
                                     dtype=np.float32)
             ui_adj[:self.userNum + self.fakeUserNum, self.userNum + self.fakeUserNum:] = uiAdj2
-            tmpRecommender.model._init_uiAdj(ui_adj + ui_adj.T)
+            try:
+                tmpRecommender.model._init_uiAdj(ui_adj + ui_adj.T)
+            except Exception:
+                tmpRecommender.data.interaction_mat = uiAdj2
             optimizer_attack = torch.optim.Adam(tmpRecommender.model.parameters(), lr=recommender.args.lRate)
             for _ in range(self.outerEpoch):
                 # Pu, Pi = tmpRecommender.model()
                 # We do not know Pu, so learn Pu
-                optimizer = torch.optim.Adam([tmpRecommender.model.embedding_dict["user_emb"]], lr=recommender.args.lRate)
+                # Seleziona embedding utente corretta
+                if "user_emb" in tmpRecommender.model.embedding_dict:
+                    emb = tmpRecommender.model.embedding_dict["user_emb"]
+                elif "user_mf_emb" in tmpRecommender.model.embedding_dict:
+                    emb = tmpRecommender.model.embedding_dict["user_mf_emb"]
+                elif "user_mlp_emb" in tmpRecommender.model.embedding_dict:
+                    emb = tmpRecommender.model.embedding_dict["user_mlp_emb"]
+                else:
+                    raise KeyError("Nessuna embedding utente trovata nel modello!")
+
+                optimizer = torch.optim.Adam([emb], lr=recommender.args.lRate)
                 tmpRecommender.train(Epoch=5, optimizer=optimizer, evalNum=5)
 
                 _, Pi = tmpRecommender.model()
@@ -102,8 +115,11 @@ class A_ra():
                 self.userNum + self.fakeUserNum + self.itemNum, self.userNum + self.fakeUserNum + self.itemNum),
                                    dtype=np.float32)
             ui_adj[:self.userNum + self.fakeUserNum, self.userNum + self.fakeUserNum:] = uiAdj
+            try:
+                recommender.model._init_uiAdj(ui_adj + ui_adj.T)
+            except Exception:
+                recommender.data.interaction_mat = uiAdj
 
-            recommender.model._init_uiAdj(ui_adj + ui_adj.T)
             recommender.train(Epoch=self.innerEpoch, optimizer=optimizer, evalNum=5)
 
             attackmetrics = AttackMetric(recommender, self.targetItem, [topk])
@@ -160,7 +176,22 @@ class A_ra():
         recommender.__init__(recommender.args, recommender.data)
 
         with torch.no_grad():
-            recommender.model.embedding_dict['user_emb'][:Pu.shape[0]] = Pu
-            recommender.model.embedding_dict['item_emb'][:] = Pi
+            # Utente
+            if 'user_emb' in recommender.model.embedding_dict:
+                recommender.model.embedding_dict['user_emb'][:Pu.shape[0]] = Pu
+            elif 'user_mf_emb' in recommender.model.embedding_dict and Pu.shape[1] == recommender.model.embedding_dict['user_mf_emb'].shape[1]:
+                recommender.model.embedding_dict['user_mf_emb'][:Pu.shape[0]] = Pu
+            elif 'user_mlp_emb' in recommender.model.embedding_dict and Pu.shape[1] == recommender.model.embedding_dict['user_mlp_emb'].shape[1]:
+                recommender.model.embedding_dict['user_mlp_emb'][:Pu.shape[0]] = Pu
+
+            # Item
+            if 'item_emb' in recommender.model.embedding_dict:
+                recommender.model.embedding_dict['item_emb'][:] = Pi
+            elif 'item_mf_emb' in recommender.model.embedding_dict and Pi.shape[1] == recommender.model.embedding_dict['item_mf_emb'].shape[1]:
+                recommender.model.embedding_dict['item_mf_emb'][:] = Pi
+            elif 'item_mlp_emb' in recommender.model.embedding_dict and Pi.shape[1] == recommender.model.embedding_dict['item_mlp_emb'].shape[1]:
+                recommender.model.embedding_dict['item_mlp_emb'][:] = Pi
+
+
 
         recommender.model = recommender.model.cuda()

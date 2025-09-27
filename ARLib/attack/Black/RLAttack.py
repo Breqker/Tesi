@@ -184,5 +184,11 @@ class MyEnv(gym.Env):
             self.userNum + self.itemNum, self.userNum  + self.itemNum),
                                 dtype=np.float32)
         ui_adj[:self.userNum , self.userNum:] = uiAdj2
-        recommender.model._init_uiAdj(ui_adj + ui_adj.T)
+        try:
+            if hasattr(recommender.model, "_init_uiAdj"):
+                recommender.model._init_uiAdj(ui_adj + ui_adj.T)
+            else:
+                recommender.data.interaction_mat = uiAdj2
+        except Exception as e:
+            recommender.data.interaction_mat = uiAdj2
 

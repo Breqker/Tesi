@@ -68,7 +68,10 @@ class BiLevelAttackByBatchInject():
                 self.userNum + self.fakeUserNum + self.itemNum, self.userNum + self.fakeUserNum + self.itemNum),
                                     dtype=np.float32)
             ui_adj[:self.userNum + self.fakeUserNum, self.userNum + self.fakeUserNum:] = uiAdj2
-            tmpRecommender.model._init_uiAdj(ui_adj + ui_adj.T)
+            try:
+                tmpRecommender.model._init_uiAdj(ui_adj + ui_adj.T)
+            except Exception:
+                tmpRecommender.model.data.interaction_mat = uiAdj2
             optimizer_attack = torch.optim.Adam(tmpRecommender.model.parameters(), lr=recommender.args.lRate)
             for _ in range(self.outerEpoch):
                 Pu, Pi = tmpRecommender.model()
@@ -102,12 +105,12 @@ class BiLevelAttackByBatchInject():
                                                 + [self.maliciousFeedbackNum//self.Epoch + 1] * (self.maliciousFeedbackNum%self.Epoch))[epoch])
             else:
                 for step, u in enumerate(self.fakeUser):
-                    uiAdj2[u,ind[step]] = -10e9
+                    uiAdj2[u, ind[step].cpu().tolist()] = -1e9
                 uiAdj2[self.fakeUser, :], indCurrent = self.project(uiAdj2[self.fakeUser, :],
                                                             ([self.maliciousFeedbackNum//self.Epoch] * (self.Epoch - self.maliciousFeedbackNum%self.Epoch) \
                                                 + [self.maliciousFeedbackNum//self.Epoch + 1] * (self.maliciousFeedbackNum%self.Epoch))[epoch])
                 for step, u in enumerate(self.fakeUser):
-                    uiAdj2[u,ind[step]] = 1
+                    uiAdj2[u, ind[step].cpu().tolist()] = 1
                 ind = torch.cat((ind,indCurrent), dim=1)
             for u in self.fakeUser:
                 uiAdj2[u,self.targetItem] = 1
@@ -119,7 +122,10 @@ class BiLevelAttackByBatchInject():
                                    dtype=np.float32)
             ui_adj[:self.userNum + self.fakeUserNum, self.userNum + self.fakeUserNum:] = uiAdj
 
-            recommender.model._init_uiAdj(ui_adj + ui_adj.T)
+            try:
+                recommender.model._init_uiAdj(ui_adj + ui_adj.T)
+            except Exception:
+                recommender.model.data.interaction_mat = uiAdj2
             recommender.train(Epoch=self.innerEpoch, optimizer=optimizer, evalNum=5)
 
             attackmetrics = AttackMetric(recommender, self.targetItem, [topk])

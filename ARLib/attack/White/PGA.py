@@ -55,98 +55,136 @@ class PGA():
         Pu, Pi = recommender.model()
         _, maxRecNumItemInd = torch.topk(torch.tensor(self.interact.sum(0)), int(Pi.shape[0] * 0.05))
         self.maxRecNumItemInd = maxRecNumItemInd
-        Pu, Pi = recommender.model()
+
+        # SGD per warm-up
         optimizer = torch.optim.SGD(recommender.model.parameters(), lr=recommender.args.lRate / 10)
         self.dataUpdate(recommender)
         recommender.__init__(recommender.args, recommender.data)
         newAdj = recommender.data.matrix()
+
+        # Inizializza embedding
         with torch.no_grad():
-            recommender.model.embedding_dict['user_emb'][:Pu.shape[0]] = Pu
-            recommender.model.embedding_dict['item_emb'][:] = Pi
+            for name, emb in recommender.model.embedding_dict.items():
+                if "user" in name.lower():
+                    dim = min(emb.shape[1], Pu.shape[1])
+                    emb[:Pu.shape[0], :dim] = Pu[:, :dim].to(emb.device)
+                elif "item" in name.lower():
+                    dim = min(emb.shape[1], Pi.shape[1])
+                    emb[:Pi.shape[0], :dim] = Pi[:, :dim].to(emb.device)
+
         self.controlledUser = list(range(self.userNum, self.userNum + self.fakeUserNum))
         recommender.train(Epoch=self.Epoch, optimizer=optimizer, evalNum=5)
         originRecommender = deepcopy(recommender)
+
+        # prepara uiAdj con fake user
         uiAdj = newAdj[:, :]
         for u in self.controlledUser:
             uiAdj[u, :] = 0
             uiAdj[u, self.targetItem] = 1
-            uiAdj[u, maxRecNumItemInd] = torch.rand([1]).item()
+            uiAdj[u, maxRecNumItemInd.cpu().tolist()] = torch.rand([1]).item()
 
         recommender = deepcopy(originRecommender)
         optimizer = torch.optim.Adam(recommender.model.parameters(), lr=recommender.args.lRate / 10)
+
         for epoch in range(self.outerEpoch):
             # outer optimization
             ui_adj = sp.csr_matrix(([], ([], [])), shape=(
-                self.userNum + self.fakeUserNum + self.itemNum, self.userNum + self.fakeUserNum + self.itemNum),
-                                   dtype=np.float32)
+                self.userNum + self.fakeUserNum + self.itemNum, 
+                self.userNum + self.fakeUserNum + self.itemNum
+            ), dtype=np.float32)
             ui_adj[:self.userNum + self.fakeUserNum, self.userNum + self.fakeUserNum:] = uiAdj
-            recommender.model._init_uiAdj(ui_adj + ui_adj.T)
+
+            try:
+                recommender.model._init_uiAdj(ui_adj + ui_adj.T)
+            except Exception:
+                recommender.model.data.interaction_mat = uiAdj
+
             recommender.train(Epoch=self.Epoch, optimizer=optimizer, evalNum=3)
 
-            # inner optimization
-            tmpRecommender = deepcopy(recommender)
-            uiAdj2 = uiAdj[:, :]
+            # inner optimization (solo se il modello supporta sparse_norm_adj)
+            if hasattr(recommender.model, "sparse_norm_adj"):
+                tmpRecommender = deepcopy(recommender)
 
-            for _ in range(self.innerEpoch):
-                users, pos_items, neg_items = [], [], []
-                for batch in range(0,self.itemNum,self.batchSize):
-                    ui_adj = sp.csr_matrix(([], ([], [])), shape=(
-                        self.userNum + self.fakeUserNum + self.itemNum, self.userNum + self.fakeUserNum + self.itemNum),
-                                           dtype=np.float32)
-                    ui_adj[:self.userNum + self.fakeUserNum, self.userNum + self.fakeUserNum:] = uiAdj2
-                    tmpRecommender.model._init_uiAdj(ui_adj + ui_adj.T)
-                    tmpRecommender.model.sparse_norm_adj.requires_grad = True
-                    Pu, Pi = tmpRecommender.model()
-                    if len(users) == 0:
-                        scores = torch.matmul(Pu, Pi.transpose(0, 1))
-                        _, top_items = torch.topk(scores, 50)
-                        top_items = [[iid.item() for iid in user_top] for user_top in top_items]
-                        for idx, u_index in enumerate(list(range(self.userNum))):
-                            for item in self.targetItem:
-                                users.append(u_index)
-                                pos_items.append(item)
-                                neg_items.append(top_items[u_index].pop())
-                    user_emb = Pu[users]
-                    pos_items_emb = Pi[pos_items]
-                    neg_items_emb = Pi[neg_items]
-                    pos_score = torch.mul(user_emb, pos_items_emb).sum(dim=1)
-                    neg_score = torch.mul(user_emb, neg_items_emb).sum(dim=1)
-                    CWloss = neg_score - pos_score
-                    CWloss = CWloss.mean()
-                    Loss = CWloss
-                    doubleGrad = torch.autograd.grad(Loss, tmpRecommender.model.sparse_norm_adj)[0]
-                    with torch.no_grad():
-                        rowsum = np.array((ui_adj+ui_adj.T).sum(1))
-                        d_inv = np.power(rowsum, -0.5).flatten()
-                        d_inv[np.isinf(d_inv)] = 0.
-                        d_mat_inv = sp.diags(d_inv)
-                        indices = torch.tensor([list(range(d_mat_inv.shape[0])), list(range(d_mat_inv.shape[0]))])
-                        values = torch.tensor(d_inv, dtype=torch.float32)
-                        d_mat_inv = torch.sparse_coo_tensor(indices=indices, values=values, size=[d_mat_inv.shape[0], d_mat_inv.shape[0]]).cuda()
-                        norm_adj_tmp = torch.sparse.mm(d_mat_inv,doubleGrad)
-                        doubleGrad = torch.sparse.mm(norm_adj_tmp,d_mat_inv)
-                    doubleGrad = doubleGrad.to_dense()
-                    grad = doubleGrad[
-                           :self.userNum + self.fakeUserNum,
-                           self.userNum + self.fakeUserNum:][self.controlledUser, :] + doubleGrad[
-                                                                                       self.userNum + self.fakeUserNum:,
-                                                                                       :self.userNum + self.fakeUserNum].T[
-                                                                                       self.controlledUser, :]
-                    with torch.no_grad():
-                        subMatrix = torch.tensor(uiAdj2[self.controlledUser, :].todense()).cuda()
-                        subMatrix -= 0.2 * torch.tanh(grad)
-                        subMatrix[subMatrix > 1] = 1
-                        subMatrix[subMatrix <= 0] = 10e-8
-                        uiAdj2[self.controlledUser, :] = subMatrix.cpu()
-                    
-                    print(">> batchNum:{} Loss:{}".format(int(batch/self.batchSize), Loss))
-            uiAdj2[self.controlledUser, :] = self.project(uiAdj2[self.controlledUser, :],
-                                                          int(self.maliciousFeedbackSize * self.itemNum))
+                for _ in range(self.innerEpoch):
+                    users, pos_items, neg_items = [], [], []
+                    for batch in range(0, self.itemNum, self.batchSize):
+                        ui_adj = sp.csr_matrix(([], ([], [])), shape=(
+                            self.userNum + self.fakeUserNum + self.itemNum,
+                            self.userNum + self.fakeUserNum + self.itemNum
+                        ), dtype=np.float32)
+                        ui_adj[:self.userNum + self.fakeUserNum, self.userNum + self.fakeUserNum:] = uiAdj
+                        tmpRecommender.model._init_uiAdj(ui_adj + ui_adj.T)
+
+                        try:
+                            tmpRecommender.model.sparse_norm_adj.requires_grad = True
+                        except Exception:
+                            pass
+
+                        Pu, Pi = tmpRecommender.model()
+
+                        if len(users) == 0:
+                            scores = torch.matmul(Pu, Pi.transpose(0, 1))
+                            _, top_items = torch.topk(scores, 50)
+                            top_items = [[iid.item() for iid in user_top] for user_top in top_items]
+                            for idx, u_index in enumerate(list(range(self.userNum))):
+                                for item in self.targetItem:
+                                    users.append(u_index)
+                                    pos_items.append(item)
+                                    neg_items.append(top_items[u_index].pop())
+
+                        # compute CW loss
+                        user_emb = Pu[users]
+                        pos_items_emb = Pi[pos_items]
+                        neg_items_emb = Pi[neg_items]
+                        pos_score = torch.mul(user_emb, pos_items_emb).sum(dim=1)
+                        neg_score = torch.mul(user_emb, neg_items_emb).sum(dim=1)
+                        CWloss = (neg_score - pos_score).mean()
+                        Loss = CWloss
+
+                        # gradiente
+                        doubleGrad = torch.autograd.grad(Loss, tmpRecommender.model.sparse_norm_adj, allow_unused=True)[0]
+                        if doubleGrad is None:
+                            doubleGrad = torch.zeros_like(tmpRecommender.model.sparse_norm_adj.to_dense())
+
+                        # aggiorna uiAdj
+                        with torch.no_grad():
+                            rowsum = np.array((ui_adj + ui_adj.T).sum(1))
+                            d_inv = np.power(rowsum, -0.5).flatten()
+                            d_inv[np.isinf(d_inv)] = 0.
+                            d_mat_inv = sp.diags(d_inv)
+                            indices = torch.tensor([list(range(d_mat_inv.shape[0])), list(range(d_mat_inv.shape[0]))])
+                            values = torch.tensor(d_inv, dtype=torch.float32)
+                            if torch.cuda.is_available():
+                                indices = indices.cuda()
+                                values = values.cuda()
+                            d_mat_inv = torch.sparse_coo_tensor(indices=indices, values=values,
+                                                                size=[d_mat_inv.shape[0], d_mat_inv.shape[0]]).to(doubleGrad.device)
+                            norm_adj_tmp = torch.sparse.mm(d_mat_inv, doubleGrad)
+                            doubleGrad = torch.sparse.mm(norm_adj_tmp, d_mat_inv)
+                            doubleGrad = doubleGrad.to_dense()
+                            grad = doubleGrad[
+                                :self.userNum + self.fakeUserNum,
+                                self.userNum + self.fakeUserNum:][self.controlledUser, :] + doubleGrad[
+                                                                                            self.userNum + self.fakeUserNum:,
+                                                                                            :self.userNum + self.fakeUserNum].T[
+                                                                                            self.controlledUser, :]
+                            subMatrix = torch.tensor(uiAdj[self.controlledUser, :].todense()).cuda()
+                            subMatrix -= 0.2 * torch.tanh(grad)
+                            subMatrix[subMatrix > 1] = 1
+                            subMatrix[subMatrix <= 0] = 1e-8
+                            uiAdj[self.controlledUser, :] = subMatrix.cpu()
+
+                        print(">> batchNum:{} Loss:{}".format(int(batch / self.batchSize), Loss))
+
+            # proietta i top-n feedback
+            uiAdj[self.controlledUser, :] = self.project(uiAdj[self.controlledUser, :],
+                                                        int(self.maliciousFeedbackSize * self.itemNum))
             for u in self.controlledUser:
                 for i in self.targetItem:
-                    uiAdj2[u, i] = 1
-            uiAdj = uiAdj2[:, :]
+                    uiAdj[u, i] = 1
+
             print("attack step {} is over\n".format(epoch + 1))
+
         self.interact = uiAdj
         return self.interact
 
@@ -157,11 +195,11 @@ class PGA():
             matrix.zero_()
             matrix.scatter_(1, indices, 1)
         except:
-            matrix = mat[:,:]
+            matrix = mat[:, :]
             for i in range(matrix.shape[0]):
                 subMatrix = torch.tensor(matrix[i, :].todense())
                 topk_values, topk_indices = torch.topk(subMatrix, n)
-                subMatrix.zero_()  
+                subMatrix.zero_()
                 subMatrix[0, topk_indices] = 1
                 matrix[i, :] = subMatrix[:, :].flatten()
         return matrix
@@ -197,8 +235,28 @@ class TorchGraphInterface(object):
         pass
 
     @staticmethod
-    def convert_sparse_mat_to_tensor(X):
+    def convert_sparse_mat_to_tensor(X, device=None, requires_grad=True):
+        """
+        Convert a scipy sparse matrix X (COO) to a torch sparse_coo_tensor.
+        - device: torch.device or string ('cpu'/'cuda') or None (defaults to current device).
+        - requires_grad: if True, the values tensor will have requires_grad=True so autograd can flow.
+        """
         coo = X.tocoo()
-        i = torch.LongTensor([coo.row, coo.col])
-        v = torch.from_numpy(coo.data).float()
-        return torch.sparse.FloatTensor(i, v, coo.shape)
+        # indices: 2 x nnz, type long
+        # ensure int64 for indices
+        row_idx = coo.row.astype(np.int64)
+        col_idx = coo.col.astype(np.int64)
+        indices = torch.LongTensor([row_idx, col_idx])
+        # values: float tensor; create as leaf and set requires_grad if requested
+        values = torch.from_numpy(coo.data.astype(np.float32))
+        if requires_grad:
+            # make a leaf tensor with requires_grad True so autograd can track it
+            values = values.clone().detach().requires_grad_(True)
+        # send to device if specified
+        if device is None:
+            device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+        indices = indices.to(device)
+        values = values.to(device)
+        # create sparse_coo_tensor (preferred over deprecated constructors)
+        sparse = torch.sparse_coo_tensor(indices, values, coo.shape, device=device)
+        return sparse

@@ -1,9 +1,8 @@
 import os
 import sys
 import time
-import gym
-from gym import spaces
-from gym.envs.registration import register
+import gymnasium as gym
+from gymnasium import spaces
 import torch
 import torch as th
 import torch.nn as nn
@@ -72,6 +71,16 @@ class PoisonRec():
                 self.agent.learn(total_timesteps=self.fakeUserNum * 100, callback=[EntropyScheduler()])
         self.env = MyEnv(self.item_num, self.fakeUser, self.maliciousFeedbackNum, self.recommender, self.targetItem)
         obs = self.env.reset()
+
+        step_result = self.env.step(action)
+
+        # Gym >=0.26 (5 valori)
+        if len(step_result) == 5:
+            obs, reward, terminated, truncated, info = step_result
+            done = terminated or truncated
+        else:  # Gym <0.26 (4 valori)
+            obs, reward, done, info = step_result
+
         done = False
         total_reward = 0
         uiAdj = self.recommender.data.matrix()
@@ -94,32 +103,58 @@ class PoisonRec():
         self.fakeUser = list(range(self.userNum, self.userNum + self.fakeUserNum))
         row, col, entries = [], [], []
         for u in self.fakeUser:
-            sampleItem =  self.targetItem
-            for i in sampleItem:
-                recommender.data.training_data.append((recommender.data.id2user[u],recommender.data.id2item[i]))
+            for i in self.targetItem:
+                recommender.data.training_data.append((recommender.data.id2user[u], recommender.data.id2item[i]))
         for pair in recommender.data.training_data:
-            row += [recommender.data.user[pair[0]]]
-            col += [recommender.data.item[pair[1]]]
-            entries += [1.0]
+            row.append(recommender.data.user[pair[0]])
+            col.append(recommender.data.item[pair[1]])
+            entries.append(1.0)
 
-        recommender.data.interaction_mat = sp.csr_matrix((entries, (row, col)),
-                                                         shape=(recommender.data.user_num, recommender.data.item_num),
-                                                         dtype=np.float32)
+        recommender.data.interaction_mat = sp.csr_matrix(
+            (entries, (row, col)),
+            shape=(recommender.data.user_num, recommender.data.item_num),
+            dtype=np.float32
+        )
 
+        # ---------- ricostruisci l'adjacency completa e normalizzata ----------
+        # ui_adj: user x item
+        ui_adj = recommender.data.interaction_mat.tocsr()
+        n_users = recommender.data.user_num
+        n_items = recommender.data.item_num
+
+        # adjacency bipartita (users | items)
+        adj_top = sp.hstack([sp.csr_matrix((n_users, n_users)), ui_adj])
+        adj_bottom = sp.hstack([ui_adj.T, sp.csr_matrix((n_items, n_items))])
+        adj = sp.vstack([adj_top, adj_bottom]).tocsr()
+
+        # normalizzazione: D^{-1/2} A D^{-1/2}
+        rowsum = np.array(adj.sum(1)).flatten()
+        d_inv_sqrt = np.power(rowsum, -0.5)
+        d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.0
+        D_inv_sqrt = sp.diags(d_inv_sqrt)
+        norm_adj = D_inv_sqrt.dot(adj).dot(D_inv_sqrt).tocsr()
+
+        # salva nel data (così il modello lo userà nel suo __init__)
+        recommender.data.norm_adj = norm_adj
+
+        # ---------- ora reinizializza il recommender (user_num già aggiornato) ----------
         recommender.__init__(recommender.args, recommender.data)
+
+        # ---------- ripristina embeddings salvate (se possibile) ----------
         with torch.no_grad():
             try:
                 recommender.model.embedding_dict['user_emb'][:Pu.shape[0]] = Pu
                 recommender.model.embedding_dict['item_emb'][:] = Pi
                 recommender.user_emb = recommender.model.embedding_dict['user_emb']
-                recommender.item_emb = recommender.model.embedding_dict['item_emb'] 
-            except:
-                recommender.model.embedding_dict['user_mf_emb'][:Pu.shape[0]] = Pu[:Pu.shape[0], :Pu.shape[1]//2]
-                recommender.model.embedding_dict['user_mlp_emb'][:Pu.shape[0]] = Pu[:Pu.shape[0], Pu.shape[1]//2:]
+                recommender.item_emb = recommender.model.embedding_dict['item_emb']
+            except Exception:
+                # fallback per modelli MF+MLP
+                recommender.model.embedding_dict['user_mf_emb'][:Pu.shape[0]] = Pu[:, :Pu.shape[1]//2]
+                recommender.model.embedding_dict['user_mlp_emb'][:Pu.shape[0]] = Pu[:, Pu.shape[1]//2:]
                 recommender.model.embedding_dict['item_mf_emb'][:] = Pi[:, :Pi.shape[1]//2]
                 recommender.model.embedding_dict['item_mlp_emb'][:] = Pi[:, Pi.shape[1]//2:]
 
-        recommender.model = recommender.model.cuda()
+            recommender.model = recommender.model.cuda()
 
 
 
@@ -144,7 +179,8 @@ class MyEnv(gym.Env):
         self.fakeUserid = 0
         self.preallocated_matrix = sp.csr_matrix((self.userNum + self.itemNum, self.userNum + self.itemNum))
 
-    def reset(self):
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
         self.itemList = self.targetItem
         self.reward = 0
         if self.fakeUserDone:
@@ -152,7 +188,7 @@ class MyEnv(gym.Env):
             self.fakeUserid = 0
         self.state = {"userId":0, "itemInteract":np.zeros(self.item_num)}
         self.state["itemInteract"][self.itemList] = 1
-        return self.state 
+        return self.state, {} 
 
     def step(self, action): 
         ones_indices = np.where(action == 1)[0]
@@ -182,7 +218,8 @@ class MyEnv(gym.Env):
         self.fakeUserid = (self.fakeUserid + 1) % self.fakeUserNum
         self.state["userId"] = self.fakeUserid
         info = {}
-        return self.state, reward, self.fakeUserDone, info
+        # Gymnasium richiede 5 valori: obs, reward, terminated, truncated, info
+        return self.state, reward, self.fakeUserDone, False, info
 
     def fakeUserInjectChange(self, recommender, fakeUserId, itemList):
 
@@ -192,7 +229,13 @@ class MyEnv(gym.Env):
         uiAdj2[self.fakeUser[fakeUserId],self.itemList] = 1
         ui_adj = self.preallocated_matrix.copy()
         ui_adj[:self.userNum, self.userNum:] = uiAdj2
-        recommender.model._init_uiAdj(ui_adj + ui_adj.T)
+        try:
+            if hasattr(recommender.model, "_init_uiAdj"):
+                recommender.model._init_uiAdj(ui_adj + ui_adj.T)
+            else:
+                recommender.data.interaction_mat = uiAdj2
+        except Exception as e:
+            recommender.data.interaction_mat = uiAdj2
 
 class CustomFeaturesExtractor(BaseFeaturesExtractor):
     def __init__(self, observation_space, features_dim=64):

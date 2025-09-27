@@ -52,7 +52,7 @@ class DLAttack():
         self.fakeUser = list(range(self.userNum, self.userNum + self.fakeUserNum))
         optimizer = torch.optim.Adam(recommender.model.parameters(), lr=recommender.args.lRate / 10)
         topk = min(recommender.topN)
-        p = torch.ones(self.itemNum).cuda()
+        p = torch.ones(self.itemNum).cuda() if torch.cuda.is_available() else torch.ones(self.itemNum)
         sigma = 0.8
         for user in self.fakeUser:
             self.fakeUserInject(recommender,user)
@@ -64,21 +64,26 @@ class DLAttack():
                 tmpRecommender.data.user_num + self.itemNum, tmpRecommender.data.user_num + self.itemNum),
                                     dtype=np.float32)
             ui_adj[:tmpRecommender.data.user_num, tmpRecommender.data.user_num:] = uiAdj2
-            tmpRecommender.model._init_uiAdj(ui_adj + ui_adj.T)
+            try:
+                tmpRecommender.model._init_uiAdj(ui_adj + ui_adj.T)
+            except Exception:
+                tmpRecommender.model.data.interaction_mat = uiAdj2
             tmpRecommender.train(Epoch=self.innerEpoch, optimizer=optimizer, evalNum=5)
             optimizer_attack = torch.optim.Adam(tmpRecommender.model.parameters(), lr=recommender.args.lRate)
             for _ in range(self.outerEpoch):
                 with torch.no_grad():
                     Pu, Pi = tmpRecommender.model()
                 scores = torch.zeros((uiAdj.shape[0], self.itemNum))
+                # if CUDA available, move scores to CUDA to match Pu/Pi device
+                if torch.cuda.is_available():
+                    scores = scores.cuda()
                 for batch in range(0,uiAdj.shape[0], self.batchSize):
                     scores[batch:batch + self.batchSize, :] = (Pu[batch:batch + self.batchSize, :] \
                                     @ Pi.T).detach()
-                # scores = torch.matmul(Pu, Pi.transpose(0, 1))
+                # mask existing interactions
                 nozeroInd = uiAdj2.nonzero()
+                # nozeroInd is tuple of arrays (rows, cols)
                 scores[nozeroInd[0],nozeroInd[1]] = -10e8
-                # scores = torch.matmul(Pu, Pi.transpose(0, 1))
-                # scores = scores - 10e8 * torch.tensor(uiAdj2.todense()).cuda()
                 _, top_items = torch.topk(scores, topk)
                 top_items = [[iid.item() for iid in user_top] for user_top in top_items]
                 for n, batch in enumerate(next_batch_pairwise(self.data, tmpRecommender.args.batch_size)):
@@ -106,30 +111,108 @@ class DLAttack():
                     optimizer_attack.step()
             with torch.no_grad():
                 Pu, Pi = tmpRecommender.model()
-            r = Pu[user,:] @ Pi.T
+            # r is 1D tensor of scores for this user (length = itemNum)
+            r = (Pu[user,:] @ Pi.T).detach()
+            # apply p weighting (ensure same device)
+            if p.device != r.device:
+                p = p.to(r.device)
             r = r * p
-            m, ind = self.project(r, self.maliciousFeedbackNum)
-            uiAdj2[user, :] = m.cpu()
-            p[ind] = p[ind] * sigma
-            if max(p) < 1:
-                p = torch.ones(self.itemNum).cuda()
+            # project returns binary vector m and indices index positions
+            m, ind = self.project(r, int(self.maliciousFeedbackNum))
+            # ensure uiAdj2 is writable: convert to lil then assign, then convert back if needed
+            try:
+                uiAdj2[user, :] = m.cpu().numpy() if isinstance(m, torch.Tensor) else m
+            except Exception:
+                # fallback: convert uiAdj2 to dense row assign
+                rowarr = uiAdj2.toarray()
+                rowarr[user, :] = m.cpu().numpy() if isinstance(m, torch.Tensor) else m
+                uiAdj2 = sp.csr_matrix(rowarr)
+            # update p
+            if isinstance(ind, torch.Tensor):
+                ind_cpu = ind.cpu().long()
+            else:
+                ind_cpu = torch.tensor(ind).long()
+            # multiply p at those indices
+            p[ind_cpu] = p[ind_cpu] * sigma
+            if float(max(p)) < 1.0:
+                p = torch.ones(self.itemNum).to(p.device)
 
             ui_adj = sp.csr_matrix(([], ([], [])), shape=(
                 recommender.data.user_num + self.itemNum, recommender.data.user_num + self.itemNum),
                                     dtype=np.float32)
             ui_adj[:recommender.data.user_num, recommender.data.user_num:] = uiAdj2
-            recommender.model._init_uiAdj(ui_adj + ui_adj.T)
-
+            try:
+                recommender.model._init_uiAdj(ui_adj + ui_adj.T)
+            except Exception:
+                recommender.model.data.interaction_mat = uiAdj2
+            
             uiAdj = uiAdj2[:, :]
         self.interact = uiAdj
         return self.interact
 
     def project(self, mat, n):
-        matrix = torch.tensor(deepcopy(mat))
-        _, indices = torch.topk(matrix, n, dim=0)
-        matrix.zero_()
-        matrix.scatter_(0, indices, 1)
-        return matrix, indices
+        """
+        Project vector or matrix `mat` onto a binary mask with top-n selections.
+        Returns (mask, indices)
+        - If mat is 1D tensor: returns mask (1D tensor same shape) and indices (1D LongTensor)
+        - If mat is 2D tensor: returns mask (same shape) and indices (LongTensor of shape (n, num_cols))
+        Robust to mat being numpy array, scipy sparse row, or torch tensor.
+        """
+        # Convert input -> torch tensor safely (avoid deepcopy on torch tensors)
+        if isinstance(mat, torch.Tensor):
+            matrix = mat.detach().clone()
+        else:
+            # try to convert numpy / sparse / list into tensor
+            try:
+                # if sparse row/col vector from scipy, convert to dense
+                if hasattr(mat, "todense"):
+                    arr = np.array(mat.todense()).squeeze()
+                else:
+                    arr = np.array(mat)
+                matrix = torch.tensor(arr, dtype=torch.float32)
+            except Exception:
+                # ultimate fallback: convert via striding
+                matrix = torch.tensor(np.asarray(mat), dtype=torch.float32)
+
+        # 1-D case: choose top-n entries
+        if matrix.dim() == 1:
+            # if n >= length: return ones
+            length = matrix.shape[0]
+            if n >= length:
+                mask = torch.ones_like(matrix)
+                indices = torch.arange(length, dtype=torch.long)
+                return mask, indices
+            values, indices = torch.topk(matrix, k=n, largest=True, sorted=False)
+            mask = torch.zeros_like(matrix)
+            mask[indices] = 1.0
+            return mask, indices
+
+        # 2-D case: choose top-n along rows for each column (dim=0) - keep original behavior
+        elif matrix.dim() == 2:
+            rows, cols = matrix.shape
+            if n >= rows:
+                mask = torch.ones_like(matrix)
+                # create indices as all row indices repeated for each column
+                indices = torch.stack([torch.arange(rows, dtype=torch.long)[:, None].repeat(1, cols)], dim=1)
+                return mask, indices
+            # topk along dim=0 yields (k, cols)
+            values, indices = torch.topk(matrix, k=n, dim=0, largest=True, sorted=False)
+            mask = torch.zeros_like(matrix)
+            # indices shape is (n, cols) -> scatter accordingly
+            mask.scatter_(0, indices, 1.0)
+            return mask, indices
+
+        else:
+            # unexpected dim, flatten and operate
+            flat = matrix.view(-1)
+            if n >= flat.shape[0]:
+                mask = torch.ones_like(flat)
+                indices = torch.arange(flat.shape[0], dtype=torch.long)
+                return mask.view_as(matrix), indices
+            values, indices = torch.topk(flat, k=n, largest=True, sorted=False)
+            mask = torch.zeros_like(flat)
+            mask[indices] = 1.0
+            return mask.view_as(matrix), indices
 
     def fakeUserInject(self, recommender, user):
         Pu, Pi = recommender.model()
@@ -160,6 +243,5 @@ class DLAttack():
                 recommender.model.embedding_dict['item_mf_emb'][:] = Pi[:, :Pi.shape[1]//2]
                 recommender.model.embedding_dict['item_mlp_emb'][:] = Pi[:, Pi.shape[1]//2:]
 
-        recommender.model = recommender.model.cuda()
-
+        recommender.model = recommender.model.cuda() if torch.cuda.is_available() else recommender.model
 

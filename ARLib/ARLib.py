@@ -91,6 +91,7 @@ class ARLib():
         self.logger.info(message)
         print(message)
 
+
     def RecommendTrain(self, attack=None):
         """
         train recommender, if data is clean, attack is None, if attack need gradient, requires_grad is True
@@ -117,13 +118,7 @@ class ARLib():
                 self.recommendModel.topN = [int(num) for num in self.recommendModel.top]
                 self.recommendModel.max_N = max(self.recommendModel.topN)
             else:
-                if self.requires_grad:
-                    self.grad = self.recommendModel.train(requires_grad=self.requires_grad)
-                else:
-                    try:
-                        self.recommendModel.train(requires_grad=False)
-                    except:
-                        self.recommendModel.train()
+                self.grad = self.recommendModel.train()
                 if self.recommendArg.save:
                     torch.save(self.recommendModel,
                                self.recommendArg.save_dir + self.recommendModelName + "/" + self.recommendModelName + "_" + str(
@@ -138,12 +133,9 @@ class ARLib():
             Pu, Pi = self.recommendModel.model()
             self.recommendModel.__init__(poisonArg, poisonData)
             if self.requires_grad:
-                self.grad = self.recommendModel.train(requires_grad=requires_grad)
+                self.grad = self.recommendModel.train(requires_adjgrad=self.requires_grad)
             else:
-                try:
-                    self.recommendModel.train(requires_grad=False)
-                except:
-                    self.recommendModel.train()
+                self.recommendModel.train()
 
             # torch.save(self.recommendModel,
             #         self.recommendArg.save_dir + self.recommendModelName + "/" + self.recommendModelName + "_" + str(

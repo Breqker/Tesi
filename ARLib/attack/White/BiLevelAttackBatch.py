@@ -69,8 +69,12 @@ class BiLevelAttackBatch():
                 self.userNum + self.fakeUserNum + self.itemNum, self.userNum + self.fakeUserNum + self.itemNum),
                                     dtype=np.float32)
             ui_adj[:self.userNum + self.fakeUserNum, self.userNum + self.fakeUserNum:] = uiAdj2
-            tmpRecommender.model._init_uiAdj(ui_adj + ui_adj.T)
+            try:
+                tmpRecommender.model._init_uiAdj(ui_adj + ui_adj.T)
+            except Exception:
+                tmpRecommender.data.interaction_mat = uiAdj2
             optimizer_attack = torch.optim.Adam(tmpRecommender.model.parameters(), lr=recommender.args.lRate)
+            recommender.train(Epoch=self.innerEpoch, optimizer=optimizer_attack, evalNum=5)
             for _ in range(self.outerEpoch):
                 Pu, Pi = tmpRecommender.model()
                 scores = torch.zeros((self.userNum + self.fakeUserNum, self.itemNum))
@@ -113,13 +117,16 @@ class BiLevelAttackBatch():
                                                 + [self.maliciousFeedbackNum//self.Epoch + 1] * (self.maliciousFeedbackNum%self.Epoch))[epoch])
             else:
                 for step, u in enumerate(self.fakeUser):
-                    uiAdj2[u,ind[step]] = -10e9
-                uiAdj2[self.fakeUser, :], indCurrent = self.relaxProject(uiAdj2[self.fakeUser, :],
-                                                            ([self.maliciousFeedbackNum//self.Epoch] * (self.Epoch - self.maliciousFeedbackNum%self.Epoch) \
-                                                + [self.maliciousFeedbackNum//self.Epoch + 1] * (self.maliciousFeedbackNum%self.Epoch))[epoch])
+                    uiAdj2[u, ind[step].cpu().numpy().astype(int)] = -1e10
+                uiAdj2[self.fakeUser, :], indCurrent = self.relaxProject(
+                    uiAdj2[self.fakeUser, :],
+                    ([self.maliciousFeedbackNum//self.Epoch] * (self.Epoch - self.maliciousFeedbackNum%self.Epoch) \
+                    + [self.maliciousFeedbackNum//self.Epoch + 1] * (self.maliciousFeedbackNum%self.Epoch))[epoch]
+                )
                 for step, u in enumerate(self.fakeUser):
-                    uiAdj2[u,ind[step]] = 1
-                ind = torch.cat((ind,indCurrent), dim=1)
+                    uiAdj2[u, ind[step].cpu().numpy().astype(int)] = 1
+                ind = torch.cat((ind, indCurrent), dim=1)
+
             for u in self.fakeUser:
                 uiAdj2[u,self.targetItem] = 1
             uiAdj = uiAdj2[:, :]
@@ -129,8 +136,10 @@ class BiLevelAttackBatch():
                 self.userNum + self.fakeUserNum + self.itemNum, self.userNum + self.fakeUserNum + self.itemNum),
                                    dtype=np.float32)
             ui_adj[:self.userNum + self.fakeUserNum, self.userNum + self.fakeUserNum:] = uiAdj
-
-            recommender.model._init_uiAdj(ui_adj + ui_adj.T)
+            try:
+                recommender.model._init_uiAdj(ui_adj + ui_adj.T)
+            except Exception:
+                recommender.model.data.interaction_mat = uiAdj2
             recommender.train(Epoch=self.innerEpoch, optimizer=optimizer, evalNum=5)
 
             attackmetrics = AttackMetric(recommender, self.targetItem, [topk])
@@ -183,36 +192,89 @@ class BiLevelAttackBatch():
         return matrix, indices
         
     def fakeUserInject(self, recommender):
-        Pu, Pi = recommender.model()
+        """
+        Inietta utenti falsi in recommender e aggiorna embeddings in modo generico/robusto.
+        """
+        Pu, Pi = recommender.model()  # Pu: [old_user_num, dim_Pu], Pi: [item_num, dim_Pi]
+
+        # aggiorna conteggio utenti e mappa id
         recommender.data.user_num += self.fakeUserNum
         for i in range(self.fakeUserNum):
-            recommender.data.user["fakeuser{}".format(i)] = len(recommender.data.user)
-            recommender.data.id2user[len(recommender.data.user) - 1] = "fakeuser{}".format(i)
+            recommender.data.user[f"fakeuser{i}"] = len(recommender.data.user)
+            recommender.data.id2user[len(recommender.data.user) - 1] = f"fakeuser{i}"
 
         self.fakeUser = list(range(self.userNum, self.userNum + self.fakeUserNum))
+
+        # crea training_data con feedback casuali per fake users
         row, col, entries = [], [], []
         for u in self.fakeUser:
-            sampleItem =  random.sample(set(list(range(self.itemNum))),self.maliciousFeedbackNum)
-            for i in sampleItem:
-                recommender.data.training_data.append((recommender.data.id2user[u],recommender.data.id2item[i]))
+            sampleItem = random.sample(range(self.itemNum), self.maliciousFeedbackNum)
+            for it in sampleItem:
+                recommender.data.training_data.append((recommender.data.id2user[u], recommender.data.id2item[it]))
+
         for pair in recommender.data.training_data:
-            row += [recommender.data.user[pair[0]]]
-            col += [recommender.data.item[pair[1]]]
-            entries += [1.0]
+            row.append(recommender.data.user[pair[0]])
+            col.append(recommender.data.item[pair[1]])
+            entries.append(1.0)
 
-        recommender.data.interaction_mat = sp.csr_matrix((entries, (row, col)),
-                                                         shape=(recommender.data.user_num, recommender.data.item_num),
-                                                         dtype=np.float32)
+        recommender.data.interaction_mat = sp.csr_matrix(
+            (entries, (row, col)),
+            shape=(recommender.data.user_num, recommender.data.item_num),
+            dtype=np.float32
+        )
 
+        # reinizializza il recommender con la nuova matrice
         recommender.__init__(recommender.args, recommender.data)
-        with torch.no_grad():
-            try:
-                recommender.model.embedding_dict['user_emb'][:Pu.shape[0]] = Pu
-                recommender.model.embedding_dict['item_emb'][:] = Pi
-            except:
-                recommender.model.embedding_dict['user_mf_emb'][:Pu.shape[0]] = Pu[:Pu.shape[0], :Pu.shape[1]//2]
-                recommender.model.embedding_dict['user_mlp_emb'][:Pu.shape[0]] = Pu[:Pu.shape[0], Pu.shape[1]//2:]
-                recommender.model.embedding_dict['item_mf_emb'][:] = Pi[:, :Pi.shape[1]//2]
-                recommender.model.embedding_dict['item_mlp_emb'][:] = Pi[:, Pi.shape[1]//2:]
 
-        recommender.model = recommender.model.cuda()
+        # ---------- trova embedding utente e item disponibili ----------
+        emb_user_candidates = ["user_emb", "user_mf_emb", "user_mlp_emb"]
+        emb_item_candidates = ["item_emb", "item_mf_emb", "item_mlp_emb"]
+
+        user_name = next((n for n in emb_user_candidates if n in recommender.model.embedding_dict), None)
+        item_name = next((n for n in emb_item_candidates if n in recommender.model.embedding_dict), None)
+
+        if user_name is None and item_name is None:
+            raise KeyError("Nessuna embedding user/item trovata nel modello.")
+
+        # ottieni i parametri (Parameter o Tensor) del modello
+        user_param = recommender.model.embedding_dict[user_name] if user_name is not None else None
+        item_param = recommender.model.embedding_dict[item_name] if item_name is not None else None
+
+        # ---------- ridimensiona Pu e Pi se necessario ----------
+        # funzione helper locale
+        def _resize_src_to_target(src, target_param):
+            # src: tensor [n_src, dim_src], target_param: Parameter/Tensor [n_target, dim_target]
+            if src is None or target_param is None:
+                return None
+            tgt_dim = target_param.shape[1]
+            src_n = src.shape[0]
+            src_dim = src.shape[1]
+            if src_dim == tgt_dim:
+                return src
+            # crea nuovo tensor e copia le colonne compatibili
+            new_src = torch.zeros(src_n, tgt_dim, device=src.device, dtype=src.dtype)
+            dim_to_copy = min(src_dim, tgt_dim)
+            new_src[:, :dim_to_copy] = src[:, :dim_to_copy]
+            return new_src
+
+        if user_param is not None:
+            Pu = _resize_src_to_target(Pu, user_param)
+        if item_param is not None:
+            Pi = _resize_src_to_target(Pi, item_param)
+
+        # ---------- copia SOLO le righe dei vecchi utenti in user_param ----------
+        with torch.no_grad():
+            if user_param is not None:
+                # sicuro: user_param ha dimensione [new_total_users, dim_target]
+                # vogliamo sovrascrivere solo le prime Pu.shape[0] righe (utenti originali)
+                rows_to_copy = min(Pu.shape[0], user_param.shape[0])
+                user_param[:rows_to_copy, :] = Pu[:rows_to_copy, :]
+
+            if item_param is not None:
+                # per gli item sovrascriviamo completamente (se dimensione coincide)
+                rows_item_to_copy = min(Pi.shape[0], item_param.shape[0])
+                item_param[:rows_item_to_copy, :] = Pi[:rows_item_to_copy, :]
+
+        # porta il modello su GPU se disponibile
+        if torch.cuda.is_available():
+            recommender.model = recommender.model.cuda()

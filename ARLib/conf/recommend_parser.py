@@ -12,7 +12,7 @@ def recommend_parse_args():
     parser.add_argument("--test_data", nargs="?", default="/test.txt", help="test data path.")
 
     # ===== model ===== #
-    parser.add_argument('--model_name', type=str, default='LightGCN', help='[LightGCN,SGL,NCL,SimGCL,XSimGCL,SSL4Rec...]')
+    parser.add_argument('--model_name', type=str, default='NCL', help='[LightGCN,SGL,NCL,SimGCL,XSimGCL,SSL4Rec...]')
     parser.add_argument('--maxEpoch', type=int, default=30, help='number of epochs')
     parser.add_argument('--batch_size', type=int, default=2048, help='batch size')
     parser.add_argument('--emb_size', type=int, default=64, help='embedding size')

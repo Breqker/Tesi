@@ -39,7 +39,7 @@ class NCL():
         self.hyper_layers = 1
         self.alpha = 1.5
         self.proto_reg = 1e-7
-        self.k = 2000
+        self.k = min(2000, self.data.user_num, self.data.item_num)
         self.reg = self.args.reg
         self.batch_size = self.args.batch_size
         self.model = LGCN_Encoder(self.data, self.args.emb_size, self.args.n_layers)
@@ -57,7 +57,8 @@ class NCL():
 
     def run_kmeans(self, x):
         """Run K-means algorithm to get k clusters of the input tensor x        """
-        kmeans = KMeans(n_clusters=self.k).fit(x)
+        k = min(self.k, x.shape[0])
+        kmeans = KMeans(n_clusters=k).fit(x)
         # kmeans = faiss.Kmeans(d=self.emb_size, k=self.k, gpu=True)
         # kmeans.train(x)
         cluster_cents = kmeans.cluster_centers_

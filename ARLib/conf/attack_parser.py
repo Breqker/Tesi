@@ -5,7 +5,7 @@ def attack_parse_args():
 
     # ===== Genneral parameters ===== #
     parser.add_argument('--attackCategory', type=str, default="Black", metavar='N',help='["Black","Gray", "White"]')
-    parser.add_argument('--attackModelName', type=str, default="RLAttack", metavar='N',help='[RandomAttack, BandwagonAttack,FedRecAttack,A_ra,CLeaR ...]')
+    parser.add_argument('--attackModelName', type=str, default="PoisonRec", metavar='N',help='[RandomAttack, BandwagonAttack,FedRecAttack,A_ra,CLeaR ...]')
 
     parser.add_argument('--times', type=int, default=5, metavar='N', help='the times of attack experiment')
     parser.add_argument('--poisonDatasetOutPath', type=str, default="data/poison/", metavar='N', help='the poisoning data sava path after attack.')
