@@ -57,42 +57,51 @@ class PoisonRec():
         self.fakeUser = list(range(self.userNum, self.userNum + self.fakeUserNum))
         self.isNormalized = True
 
-    def posionDataAttack(self,recommender):
+    def posionDataAttack(self, recommender):
         self.recommender = recommender
         self.fakeUserInject(self.recommender)
+
+        # Inizializza l'ambiente e l'agente se non esistono
         if self.env is None:
-            # policy_kwargs = dict(features_extractor_class=CustomFeaturesExtractor)
             self.env = MyEnv(self.item_num, self.fakeUser, self.maliciousFeedbackNum, self.recommender, self.targetItem)
-            self.agent = PPO(CustomPolicy, self.env, verbose=1, clip_range=0.1, target_kl=0.03, ent_coef=0.1, gamma=1, n_steps=self.fakeUserNum,\
-                                     n_epochs=5, batch_size=self.fakeUserNum, vf_coef=0.5, max_grad_norm=0.5, learning_rate=0.01)
+            self.agent = PPO(
+                CustomPolicy, self.env, verbose=1, clip_range=0.1, target_kl=0.03, ent_coef=0.1, gamma=1,
+                n_steps=self.fakeUserNum, n_epochs=5, batch_size=self.fakeUserNum, vf_coef=0.5,
+                max_grad_norm=0.5, learning_rate=0.01
+            )
             if self.isNormalized:
                 self.agent.learn(total_timesteps=self.fakeUserNum * 100, callback=[RewardNormalizer(), EntropyScheduler()])
             else:
                 self.agent.learn(total_timesteps=self.fakeUserNum * 100, callback=[EntropyScheduler()])
-        self.env = MyEnv(self.item_num, self.fakeUser, self.maliciousFeedbackNum, self.recommender, self.targetItem)
-        obs = self.env.reset()
 
-        step_result = self.env.step(action)
-
-        # Gym >=0.26 (5 valori)
-        if len(step_result) == 5:
-            obs, reward, terminated, truncated, info = step_result
-            done = terminated or truncated
-        else:  # Gym <0.26 (4 valori)
-            obs, reward, done, info = step_result
-
+        # Reset dell'ambiente
+        obs, _ = self.env.reset()  # Gymnasium >=0.26
         done = False
         total_reward = 0
         uiAdj = self.recommender.data.matrix()
+
         while not done:
+            # Predizione dell'azione
             action, _states = self.agent.predict(obs, deterministic=True)
-            obs, reward, done, info = self.env.step(action)
+            # Esegui il passo nell'ambiente
+            step_result = self.env.step(action)
+
+            # Gestione compatibilità Gym >=0.26
+            if len(step_result) == 5:
+                obs, reward, terminated, truncated, info = step_result
+                done = terminated or truncated
+            else:  # Gym <0.26
+                obs, reward, done, info = step_result
+
             total_reward += reward
-            uiAdj[self.fakeUser[self.env.fakeUserid],:] = 0  
-            uiAdj[self.fakeUser[self.env.fakeUserid],self.env.itemList] = 1
+            # Aggiorna la matrice user-item per il fake user corrente
+            uiAdj[self.fakeUser[self.env.fakeUserid], :] = 0
+            uiAdj[self.fakeUser[self.env.fakeUserid], self.env.itemList] = 1
+
         self.interact = uiAdj
         return self.interact
 
+    
     def fakeUserInject(self, recommender):
         Pu, Pi = recommender.model()
         recommender.data.user_num += self.fakeUserNum
