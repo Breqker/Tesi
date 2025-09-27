@@ -12,6 +12,20 @@ from util.loss import bpr_loss, l2_reg_loss
 from sklearn.neighbors import LocalOutlierFactor as LOF
 import logging
 
+def compute_norm_adj(adj_full: sp.spmatrix) -> sp.csr_matrix:
+    """Return normalized adjacency D^{-1/2} A D^{-1/2} as csr_matrix."""
+    rowsum = np.array(adj_full.sum(1)).flatten()
+    d_inv_sqrt = np.power(rowsum, -0.5, where=rowsum != 0)
+    d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.0
+    D_inv_sqrt = sp.diags(d_inv_sqrt)
+    norm_adj = D_inv_sqrt.dot(adj_full).dot(D_inv_sqrt)
+    return norm_adj.tocsr()
+
+def convert_sparse_mat_to_tensor(X: sp.spmatrix):
+    coo = X.tocoo()
+    i = torch.LongTensor([coo.row, coo.col])
+    v = torch.from_numpy(coo.data).float()
+    return torch.sparse.FloatTensor(i, v, coo.shape)
 
 class InfoAttack():
     def __init__(self, arg, data):
@@ -65,14 +79,22 @@ class InfoAttack():
         for epoch in range(self.Epoch):
             tmpRecommender = deepcopy(recommender)
             uiAdj2 = uiAdj[:, :]
-            ui_adj = sp.csr_matrix(([], ([], [])), shape=(
-                self.userNum + self.fakeUserNum + self.itemNum, self.userNum + self.fakeUserNum + self.itemNum),
-                                    dtype=np.float32)
-            ui_adj[:self.userNum + self.fakeUserNum, self.userNum + self.fakeUserNum:] = uiAdj2
+            # costruisci full adjacency per tmpRecommender e aggiorna norm_adj
+            user_num_tmp = tmpRecommender.data.user_num
+            item_num_tmp = tmpRecommender.data.item_num
+            adj_top_tmp = sp.hstack([sp.csr_matrix((user_num_tmp, user_num_tmp)), uiAdj2], format='csr')
+            adj_bottom_tmp = sp.hstack([uiAdj2.T, sp.csr_matrix((item_num_tmp, item_num_tmp))], format='csr')
+            adj_full_tmp = sp.vstack([adj_top_tmp, adj_bottom_tmp], format='csr')
+
+            # aggiorna data.norm_adj usata dal modello (NCL.train legge self.data.norm_adj)
+            tmpRecommender.data.norm_adj = compute_norm_adj(adj_full_tmp)
+
+            # prova ad inizializzare il modello con la nuova adjacency (fallback se il metodo non esiste)
             try:
-                tmpRecommender.model._init_uiAdj(ui_adj + ui_adj.T)
+                tmpRecommender.model._init_uiAdj(adj_full_tmp)
             except Exception:
-                tmpRecommender.model.data.interaction_mat = uiAdj2
+                tmpRecommender.data.interaction_mat = uiAdj2
+
             optimizer_attack = torch.optim.Adam(tmpRecommender.model.parameters(), lr=recommender.args.lRate)
             for _ in range(self.outerEpoch):
                 Pu, Pi = tmpRecommender.model()
@@ -80,8 +102,8 @@ class InfoAttack():
                 for batch in range(0,self.userNum + self.fakeUserNum, self.batchSize):
                     scores[batch:batch + self.batchSize, :] = (Pu[batch:batch + self.batchSize, :] \
                                     @ Pi.T).detach()
-                nozeroInd = uiAdj2.indices
-                scores[nozeroInd[0],nozeroInd[1]] = -10e8
+                nozeroInd = uiAdj2.nonzero()   # tuple (rows, cols)
+                scores[nozeroInd[0], nozeroInd[1]] = -1e9
                 _, top_items = torch.topk(scores, topk)
                 top_items = [[iid.item() for iid in user_top] for user_top in top_items]
                 users, pos_items, neg_items = [], [], []
@@ -185,38 +207,65 @@ class InfoAttack():
 
     def fakeUserInject(self, recommender):
         Pu, Pi = recommender.model()
+        Pu = Pu.detach().cpu()
+        Pi = Pi.detach().cpu()
+
+
+        # aggiorna user_num e mappe
         recommender.data.user_num += self.fakeUserNum
         for i in range(self.fakeUserNum):
-            recommender.data.user["fakeuser{}".format(i)] = len(recommender.data.user)
-            recommender.data.id2user[len(recommender.data.user) - 1] = "fakeuser{}".format(i)
+            recommender.data.user[f"fakeuser{i}"] = len(recommender.data.user)
+            recommender.data.id2user[len(recommender.data.user) - 1] = f"fakeuser{i}"
 
+        # aggiorna lista fake users
         self.fakeUser = list(range(self.userNum, self.userNum + self.fakeUserNum))
+
+        # costruisci training_data -> interaction_mat
         row, col, entries = [], [], []
         for u in self.fakeUser:
-            sampleItem =  random.sample(set(list(range(self.itemNum))),self.maliciousFeedbackNum)
-            for i in sampleItem:
-                recommender.data.training_data.append((recommender.data.id2user[u],recommender.data.id2item[i]))
+            sampleItem = random.sample(range(self.itemNum), self.maliciousFeedbackNum)
+            for it in sampleItem:
+                recommender.data.training_data.append((recommender.data.id2user[u], recommender.data.id2item[it]))
         for pair in recommender.data.training_data:
-            row += [recommender.data.user[pair[0]]]
-            col += [recommender.data.item[pair[1]]]
-            entries += [1.0]
+            row.append(recommender.data.user[pair[0]])
+            col.append(recommender.data.item[pair[1]])
+            entries.append(1.0)
 
-        recommender.data.interaction_mat = sp.csr_matrix((entries, (row, col)),
-                                                         shape=(recommender.data.user_num, recommender.data.item_num),
-                                                         dtype=np.float32)
+        recommender.data.interaction_mat = sp.csr_matrix(
+            (entries, (row, col)),
+            shape=(recommender.data.user_num, recommender.data.item_num),
+            dtype=np.float32
+        )
 
+        # costruisci adjacency bipartita completa e normalize (user+item)
+        user_num = recommender.data.user_num
+        item_num = recommender.data.item_num
+        ui_adj = recommender.data.interaction_mat.tocsr()
+        adj_top = sp.hstack([sp.csr_matrix((user_num, user_num)), ui_adj], format='csr')
+        adj_bottom = sp.hstack([ui_adj.T, sp.csr_matrix((item_num, item_num))], format='csr')
+        adj_full = sp.vstack([adj_top, adj_bottom], format='csr')
+        recommender.data.norm_adj = compute_norm_adj(adj_full)
+
+        # reinizializza il recommender (user_num aggiornato)
         recommender.__init__(recommender.args, recommender.data)
-        with torch.no_grad():
-            try:
-                recommender.model.embedding_dict['user_emb'][:Pu.shape[0]] = Pu
-                recommender.model.embedding_dict['item_emb'][:] = Pi
-            except:
-                recommender.model.embedding_dict['user_mf_emb'][:Pu.shape[0]] = Pu[:Pu.shape[0], :Pu.shape[1]//2]
-                recommender.model.embedding_dict['user_mlp_emb'][:Pu.shape[0]] = Pu[:Pu.shape[0], Pu.shape[1]//2:]
-                recommender.model.embedding_dict['item_mf_emb'][:] = Pi[:, :Pi.shape[1]//2]
-                recommender.model.embedding_dict['item_mlp_emb'][:] = Pi[:, Pi.shape[1]//2:]
 
+        # ripristina embeddings vecchie se possibile (copia righe presenti)
+        with torch.no_grad():
+            if Pu is not None and 'user_emb' in recommender.model.embedding_dict:
+                recommender.model.embedding_dict['user_emb'][:Pu.shape[0], :] = Pu
+            if Pi is not None and 'item_emb' in recommender.model.embedding_dict:
+                recommender.model.embedding_dict['item_emb'][:Pi.shape[0], :] = Pi
+
+        # aggiorna sparse_norm_adj
+        try:
+            recommender.model.sparse_norm_adj = convert_sparse_mat_to_tensor(recommender.data.norm_adj).cuda()
+        except Exception:
+            recommender.model.sparse_norm_adj = convert_sparse_mat_to_tensor(recommender.data.norm_adj)
+        
         recommender.model = recommender.model.cuda()
+
+
+    
     def InfoNCE(self, view1, view2, temperature):
         view1, view2 = F.normalize(view1, dim=1), F.normalize(view2, dim=1)
         pos_score = (view1 * view2).sum(dim=-1)
