@@ -13,6 +13,19 @@ from sklearn.neighbors import LocalOutlierFactor as LOF
 from recommender.GMF import GMF
 import logging
 
+def compute_norm_adj(adj_full):
+    rowsum = np.array(adj_full.sum(1)).flatten()
+    rowsum_inv_sqrt = np.power(rowsum, -0.5, where=rowsum != 0)
+    rowsum_inv_sqrt[np.isinf(rowsum_inv_sqrt)] = 0.
+    D_inv_sqrt = sp.diags(rowsum_inv_sqrt)
+    norm_adj = D_inv_sqrt.dot(adj_full).dot(D_inv_sqrt)
+    return norm_adj.tocsr()
+
+def convert_sparse_mat_to_tensor(X):
+    coo = X.tocoo()
+    i = torch.LongTensor([coo.row, coo.col])
+    v = torch.from_numpy(coo.data).float()
+    return torch.sparse.FloatTensor(i, v, coo.shape)
 
 class A_ra():
     def __init__(self, arg, data):
@@ -154,44 +167,51 @@ class A_ra():
     def fakeUserInject(self, recommender):
         Pu, Pi = recommender.model()
         recommender.data.user_num += self.fakeUserNum
+
         for i in range(self.fakeUserNum):
             recommender.data.user["fakeuser{}".format(i)] = len(recommender.data.user)
             recommender.data.id2user[len(recommender.data.user) - 1] = "fakeuser{}".format(i)
 
         self.fakeUser = list(range(self.userNum, self.userNum + self.fakeUserNum))
+
+        # Aggiorna interazioni dei fake user
         row, col, entries = [], [], []
         for u in self.fakeUser:
-            sampleItem =  random.sample(set(list(range(self.itemNum))),self.maliciousFeedbackNum)
+            sampleItem = random.sample(set(range(self.itemNum)), self.maliciousFeedbackNum)
             for i in sampleItem:
-                recommender.data.training_data.append((recommender.data.id2user[u],recommender.data.id2item[i]))
+                recommender.data.training_data.append((recommender.data.id2user[u], recommender.data.id2item[i]))
         for pair in recommender.data.training_data:
-            row += [recommender.data.user[pair[0]]]
-            col += [recommender.data.item[pair[1]]]
-            entries += [1.0]
+            row.append(recommender.data.user[pair[0]])
+            col.append(recommender.data.item[pair[1]])
+            entries.append(1.0)
 
-        recommender.data.interaction_mat = sp.csr_matrix((entries, (row, col)),
-                                                         shape=(recommender.data.user_num, recommender.data.item_num),
-                                                         dtype=np.float32)
+        recommender.data.interaction_mat = sp.csr_matrix(
+            (entries, (row, col)), shape=(recommender.data.user_num, recommender.data.item_num), dtype=np.float32
+        )
 
+        # Ricostruisci matrice bipartita completa (user+item)
+        uiAdj = recommender.data.interaction_mat
+        user_num = recommender.data.user_num
+        item_num = recommender.data.item_num
+        ui_adj_full = sp.lil_matrix((user_num + item_num, user_num + item_num), dtype=np.float32)
+        ui_adj_full[:user_num, user_num:] = uiAdj
+        ui_adj_full = ui_adj_full.tocsr()
+
+        # normalizza e aggiorna data.norm_adj
+        recommender.data.norm_adj = compute_norm_adj(ui_adj_full)
+
+        # reinizializza modello
         recommender.__init__(recommender.args, recommender.data)
 
         with torch.no_grad():
-            # Utente
+            # copia embeddings vecchie
             if 'user_emb' in recommender.model.embedding_dict:
                 recommender.model.embedding_dict['user_emb'][:Pu.shape[0]] = Pu
-            elif 'user_mf_emb' in recommender.model.embedding_dict and Pu.shape[1] == recommender.model.embedding_dict['user_mf_emb'].shape[1]:
-                recommender.model.embedding_dict['user_mf_emb'][:Pu.shape[0]] = Pu
-            elif 'user_mlp_emb' in recommender.model.embedding_dict and Pu.shape[1] == recommender.model.embedding_dict['user_mlp_emb'].shape[1]:
-                recommender.model.embedding_dict['user_mlp_emb'][:Pu.shape[0]] = Pu
-
-            # Item
             if 'item_emb' in recommender.model.embedding_dict:
-                recommender.model.embedding_dict['item_emb'][:] = Pi
-            elif 'item_mf_emb' in recommender.model.embedding_dict and Pi.shape[1] == recommender.model.embedding_dict['item_mf_emb'].shape[1]:
-                recommender.model.embedding_dict['item_mf_emb'][:] = Pi
-            elif 'item_mlp_emb' in recommender.model.embedding_dict and Pi.shape[1] == recommender.model.embedding_dict['item_mlp_emb'].shape[1]:
-                recommender.model.embedding_dict['item_mlp_emb'][:] = Pi
+                recommender.model.embedding_dict['item_emb'][:Pi.shape[0]] = Pi
 
+        # aggiorna sparse_norm_adj
 
-
+        recommender.model.sparse_norm_adj = convert_sparse_mat_to_tensor(recommender.data.norm_adj).cuda()
+   
         recommender.model = recommender.model.cuda()

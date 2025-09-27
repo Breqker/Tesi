@@ -8,6 +8,19 @@ from copy import deepcopy
 from util.tool import targetItemSelect
 from util.metrics import AttackMetric
 
+def compute_norm_adj(adj_full):
+    rowsum = np.array(adj_full.sum(1)).flatten()
+    rowsum_inv_sqrt = np.power(rowsum, -0.5, where=rowsum != 0)
+    rowsum_inv_sqrt[np.isinf(rowsum_inv_sqrt)] = 0.
+    D_inv_sqrt = sp.diags(rowsum_inv_sqrt)
+    norm_adj = D_inv_sqrt.dot(adj_full).dot(D_inv_sqrt)
+    return norm_adj.tocsr()
+
+def convert_sparse_mat_to_tensor(X):
+    coo = X.tocoo()
+    i = torch.LongTensor([coo.row, coo.col])
+    v = torch.from_numpy(coo.data).float()
+    return torch.sparse.FloatTensor(i, v, coo.shape)
 
 class FedRecAttack():
     def __init__(self, arg, data):
@@ -170,7 +183,6 @@ class FedRecAttack():
         return matrix
 
     def fakeUserInject(self, recommender):
-        # Recupera embedding attuali
         Pu, Pi = recommender.model()
 
         # Aggiorna numero utenti
@@ -179,32 +191,38 @@ class FedRecAttack():
             recommender.data.user[f"fakeuser{i}"] = len(recommender.data.user)
             recommender.data.id2user[len(recommender.data.user) - 1] = f"fakeuser{i}"
 
-        # Indici utenti falsi
         self.fakeUser = list(range(self.userNum, self.userNum + self.fakeUserNum))
 
-        # Crea interazioni per utenti falsi
+        # Aggiorna interazioni fake user
         row, col, entries = [], [], []
         for u in self.fakeUser:
             sampleItem = random.sample(set(range(self.itemNum)), self.maliciousFeedbackNum)
             for i in sampleItem:
                 recommender.data.training_data.append((recommender.data.id2user[u], recommender.data.id2item[i]))
-
         for pair in recommender.data.training_data:
             row.append(recommender.data.user[pair[0]])
             col.append(recommender.data.item[pair[1]])
             entries.append(1.0)
 
-        # Aggiorna matrice di interazione
         recommender.data.interaction_mat = sp.csr_matrix(
             (entries, (row, col)),
             shape=(recommender.data.user_num, recommender.data.item_num),
             dtype=np.float32
         )
 
-        # Ricostruisci il recommender
+        # Ricostruisci matrice bipartita completa e normalizza
+        uiAdj = recommender.data.interaction_mat
+        user_num = recommender.data.user_num
+        item_num = recommender.data.item_num
+        ui_adj_full = sp.lil_matrix((user_num + item_num, user_num + item_num), dtype=np.float32)
+        ui_adj_full[:user_num, user_num:] = uiAdj
+        ui_adj_full = ui_adj_full.tocsr()
+        recommender.data.norm_adj = compute_norm_adj(ui_adj_full)
+
+        # Reinicializza il modello
         recommender.__init__(recommender.args, recommender.data)
 
-        # Aggiorna embedding utente preservando compatibilità dimensionale
+        # Copia embeddings vecchie
         with torch.no_grad():
             if "user_emb" in recommender.model.embedding_dict:
                 user_param = recommender.model.embedding_dict["user_emb"]
@@ -216,16 +234,17 @@ class FedRecAttack():
                 raise KeyError("Nessuna embedding utente compatibile trovata per l'iniezione.")
 
             target_dim = user_param.shape[1]
-
-            # Se le dimensioni non coincidono, fai padding con zeri o tronca
             if Pu.shape[1] != target_dim:
                 new_Pu = torch.zeros(Pu.shape[0], target_dim, device=Pu.device)
                 dim_to_copy = min(Pu.shape[1], target_dim)
                 new_Pu[:, :dim_to_copy] = Pu[:, :dim_to_copy]
                 Pu = new_Pu
-
-            # Copia embedding utente aggiornate
             user_param[:Pu.shape[0], :] = Pu
 
-        # Manda il modello su GPU se disponibile
+            if 'item_emb' in recommender.model.embedding_dict:
+                recommender.model.embedding_dict['item_emb'][:Pi.shape[0]] = Pi
+
+        # Aggiorna sparse_norm_adj
+        recommender.model.sparse_norm_adj = convert_sparse_mat_to_tensor(recommender.data.norm_adj).cuda()
+
         recommender.model = recommender.model.cuda()

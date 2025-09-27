@@ -174,8 +174,8 @@ class MyEnv(gym.Env):
         return self.state, reward, self.fakeUserDone, info
 
     def fakeUserInjectChange(self, recommender, fakeUserId, itemList):
-        self.userNum = recommender.data.user_num
-        self.itemNum = recommender.data.item_num
+        userNum = recommender.data.user_num
+        itemNum = recommender.data.item_num
         uiAdj = recommender.data.matrix()
         uiAdj2 = uiAdj[:, :]
         uiAdj2[self.fakeUser[fakeUserId],:] = 0 

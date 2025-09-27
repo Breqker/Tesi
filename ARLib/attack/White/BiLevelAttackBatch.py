@@ -13,6 +13,19 @@ from sklearn.neighbors import LocalOutlierFactor as LOF
 from recommender.GMF import GMF
 import logging
 
+def compute_norm_adj(adj_full):
+    rowsum = np.array(adj_full.sum(1)).flatten()
+    rowsum_inv_sqrt = np.power(rowsum, -0.5, where=rowsum != 0)
+    rowsum_inv_sqrt[np.isinf(rowsum_inv_sqrt)] = 0.
+    D_inv_sqrt = sp.diags(rowsum_inv_sqrt)
+    norm_adj = D_inv_sqrt.dot(adj_full).dot(D_inv_sqrt)
+    return norm_adj.tocsr()
+
+def convert_sparse_mat_to_tensor(X):
+    coo = X.tocoo()
+    i = torch.LongTensor([coo.row, coo.col])
+    v = torch.from_numpy(coo.data).float()
+    return torch.sparse.FloatTensor(i, v, coo.shape)
 
 class BiLevelAttackBatch():
     def __init__(self, arg, data):
@@ -192,12 +205,9 @@ class BiLevelAttackBatch():
         return matrix, indices
         
     def fakeUserInject(self, recommender):
-        """
-        Inietta utenti falsi in recommender e aggiorna embeddings in modo generico/robusto.
-        """
-        Pu, Pi = recommender.model()  # Pu: [old_user_num, dim_Pu], Pi: [item_num, dim_Pi]
+        Pu, Pi = recommender.model()
 
-        # aggiorna conteggio utenti e mappa id
+        # Aggiorna numero utenti e mappe id
         recommender.data.user_num += self.fakeUserNum
         for i in range(self.fakeUserNum):
             recommender.data.user[f"fakeuser{i}"] = len(recommender.data.user)
@@ -205,7 +215,7 @@ class BiLevelAttackBatch():
 
         self.fakeUser = list(range(self.userNum, self.userNum + self.fakeUserNum))
 
-        # crea training_data con feedback casuali per fake users
+        # Genera interazioni fake
         row, col, entries = [], [], []
         for u in self.fakeUser:
             sampleItem = random.sample(range(self.itemNum), self.maliciousFeedbackNum)
@@ -223,58 +233,49 @@ class BiLevelAttackBatch():
             dtype=np.float32
         )
 
-        # reinizializza il recommender con la nuova matrice
+        # --- Aggiorna matrice bipartita completa e normalizzata ---
+        user_num = recommender.data.user_num
+        item_num = recommender.data.item_num
+        ui_adj_full = sp.lil_matrix((user_num + item_num, user_num + item_num), dtype=np.float32)
+        ui_adj_full[:user_num, user_num:] = recommender.data.interaction_mat
+        ui_adj_full = ui_adj_full.tocsr()
+        recommender.data.norm_adj = compute_norm_adj(ui_adj_full)
+
+        # Reinicializza il recommender
         recommender.__init__(recommender.args, recommender.data)
 
-        # ---------- trova embedding utente e item disponibili ----------
+        # Ridimensiona Pu/Pi se necessario
+        def _resize(src, target):
+            if src is None or target is None:
+                return None
+            tgt_dim = target.shape[1]
+            src_n, src_dim = src.shape
+            if src_dim == tgt_dim:
+                return src
+            new_src = torch.zeros(src_n, tgt_dim, device=src.device, dtype=src.dtype)
+            new_src[:, :min(src_dim, tgt_dim)] = src[:, :min(src_dim, tgt_dim)]
+            return new_src
+
         emb_user_candidates = ["user_emb", "user_mf_emb", "user_mlp_emb"]
         emb_item_candidates = ["item_emb", "item_mf_emb", "item_mlp_emb"]
 
         user_name = next((n for n in emb_user_candidates if n in recommender.model.embedding_dict), None)
         item_name = next((n for n in emb_item_candidates if n in recommender.model.embedding_dict), None)
 
-        if user_name is None and item_name is None:
-            raise KeyError("Nessuna embedding user/item trovata nel modello.")
-
-        # ottieni i parametri (Parameter o Tensor) del modello
-        user_param = recommender.model.embedding_dict[user_name] if user_name is not None else None
-        item_param = recommender.model.embedding_dict[item_name] if item_name is not None else None
-
-        # ---------- ridimensiona Pu e Pi se necessario ----------
-        # funzione helper locale
-        def _resize_src_to_target(src, target_param):
-            # src: tensor [n_src, dim_src], target_param: Parameter/Tensor [n_target, dim_target]
-            if src is None or target_param is None:
-                return None
-            tgt_dim = target_param.shape[1]
-            src_n = src.shape[0]
-            src_dim = src.shape[1]
-            if src_dim == tgt_dim:
-                return src
-            # crea nuovo tensor e copia le colonne compatibili
-            new_src = torch.zeros(src_n, tgt_dim, device=src.device, dtype=src.dtype)
-            dim_to_copy = min(src_dim, tgt_dim)
-            new_src[:, :dim_to_copy] = src[:, :dim_to_copy]
-            return new_src
+        user_param = recommender.model.embedding_dict[user_name] if user_name else None
+        item_param = recommender.model.embedding_dict[item_name] if item_name else None
 
         if user_param is not None:
-            Pu = _resize_src_to_target(Pu, user_param)
+            Pu = _resize(Pu, user_param)
+            with torch.no_grad():
+                user_param[:Pu.shape[0], :] = Pu
+
         if item_param is not None:
-            Pi = _resize_src_to_target(Pi, item_param)
+            Pi = _resize(Pi, item_param)
+            with torch.no_grad():
+                item_param[:Pi.shape[0], :] = Pi
 
-        # ---------- copia SOLO le righe dei vecchi utenti in user_param ----------
-        with torch.no_grad():
-            if user_param is not None:
-                # sicuro: user_param ha dimensione [new_total_users, dim_target]
-                # vogliamo sovrascrivere solo le prime Pu.shape[0] righe (utenti originali)
-                rows_to_copy = min(Pu.shape[0], user_param.shape[0])
-                user_param[:rows_to_copy, :] = Pu[:rows_to_copy, :]
-
-            if item_param is not None:
-                # per gli item sovrascriviamo completamente (se dimensione coincide)
-                rows_item_to_copy = min(Pi.shape[0], item_param.shape[0])
-                item_param[:rows_item_to_copy, :] = Pi[:rows_item_to_copy, :]
-
-        # porta il modello su GPU se disponibile
-        if torch.cuda.is_available():
-            recommender.model = recommender.model.cuda()
+        # Aggiorna sparse_norm_adj
+        recommender.model.sparse_norm_adj = convert_sparse_mat_to_tensor(recommender.data.norm_adj).cuda()
+ 
+        recommender.model = recommender.model.cuda()
